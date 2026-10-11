@@ -25,7 +25,8 @@
   const SYNC_KEY = 'sevilla-sync', SHADOW_KEY = 'sevilla-shadow', PHOTOQ_KEY = 'sevilla-fotos-pendientes';
   const MAPS = ['done', 'notes', 'edits', 'hidden', 'days', 'resv'];
   const LISTS = ['custom', 'bookings', 'journal', 'expenses'];
-  let syncUrl = lsGet(SYNC_KEY) || '';
+  const storedSync = lsGet(SYNC_KEY);
+  let syncUrl = storedSync === 'off' ? '' : storedSync || SYNC_DEFAULT;
   let shadow = {};   // último estado que sabemos que está en la nube
   try { shadow = JSON.parse(lsGet(SHADOW_KEY) || '{}'); } catch (e) { /* vacío */ }
   let es = null, online = false, pushing = false, retryT, dirty = false;
@@ -145,7 +146,7 @@
   }
   function setSync(url) {
     syncUrl = url || '';
-    lsSet(SYNC_KEY, syncUrl || null);
+    lsSet(SYNC_KEY, syncUrl || 'off');
     shadow = {};
     lsSet(SHADOW_KEY, null);
     connect();
@@ -472,13 +473,12 @@
       <div class="section-title">Sincronización entre los dos móviles</div>
       <div class="panel">${syncUrl ? `
         <h3>${online ? (pendingCount() ? 'Enviando cambios…' : 'Sincronizado') : 'Sin conexión'}</h3>
-        <p class="txt">Lo que marca o apunta uno le aparece al otro al momento. Sin cobertura se guarda en el móvil y se envía al recuperarla.</p>
+        <p class="txt">Lo que marca o apunta uno le aparece al otro al momento, sin hacer nada. Sin cobertura se guarda en el móvil y se envía al recuperarla.</p>
         <div class="actions">
-          <button class="btn primary" data-act="sync-share">Enviar enlace al otro móvil</button>
           <button class="btn danger" data-act="sync-off">Desactivar aquí</button>
         </div>` : `
         <h3>Desactivada</h3>
-        <p class="txt">Pegad aquí el enlace que os ha enviado el otro móvil, o la URL de vuestra base de datos para empezar.</p>
+        <p class="txt">Este móvil no está compartiendo los cambios. Pulsad «Activar» para volver a la sala del viaje (o pegad antes otro enlace).</p>
         <label class="f" style="margin-top:10px"><input id="syncInput" placeholder="https://…" autocapitalize="off" autocorrect="off" spellcheck="false" style="background:var(--fill)"></label>
         <div class="actions"><button class="btn primary" data-act="sync-on">Activar</button></div>`}
       </div>
@@ -767,7 +767,7 @@
       case 'e-del': state.expenses = state.expenses.filter((x) => x.id !== id); save(); render(); break;
       case 'theme': theme = applyTheme(id); render(); break;
       case 'sync-on': {
-        const url = parseSync($('#syncInput').value);
+        const url = $('#syncInput').value.trim() ? parseSync($('#syncInput').value) : SYNC_DEFAULT;
         if (!url) { toast('Ese enlace no es válido'); break; }
         setSync(url); render(); toast('Sincronización activada');
         break;

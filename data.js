@@ -11,6 +11,10 @@ const TRIP = {
   stay: { name: 'Alojamiento', address: 'Zona San Juan de la Palma, Sevilla' },
 };
 
+// Sala compartida donde se sincronizan los dos móviles (Firebase Realtime Database).
+// Quien tenga esta dirección puede leer y cambiar lo apuntado: no guardéis aquí nada sensible.
+const SYNC_DEFAULT = 'https://sevilla-viaje-default-rtdb.europe-west1.firebasedatabase.app/sevilla-cyxrgdX2g9U5bHR6H1yO6KNR';
+
 const DAYS = [
   {
     date: '2026-11-07', short: 'Sáb', num: 7, name: 'Sábado 7',

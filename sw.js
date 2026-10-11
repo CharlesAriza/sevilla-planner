@@ -1,5 +1,5 @@
 // Red primero, caché como respaldo: siempre la última versión con cobertura, y funciona sin ella.
-const CACHE = 'sevilla-v3';
+const CACHE = 'sevilla-v4';
 const FILES = ['./', 'index.html', 'styles.css', 'data.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
