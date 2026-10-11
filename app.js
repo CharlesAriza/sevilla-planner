@@ -449,8 +449,172 @@
       <div class="seg" style="margin-top:14px">
         <button class="${resvFilter === 'todo' ? 'on' : ''}" data-act="resv-filter" data-id="todo">Pendientes · ${need.length - ok}</button>
         <button class="${resvFilter === 'all' ? 'on' : ''}" data-act="resv-filter" data-id="all">Todas · ${all.length}</button>
+        <button class="${resvFilter === 'tix' ? 'on' : ''}" data-act="resv-filter" data-id="tix">Billetes${tKey && tLoaded ? ` · ${tickets.length}` : ''}</button>
       </div>
-      ${list || '<div class="empty">No queda nada por reservar.</div>'}`;
+      ${resvFilter === 'tix' ? viewTickets() : list || '<div class="empty">No queda nada por reservar.</div>'}`;
+  }
+
+  // ---------- Billetes (cifrados en el móvil) ----------
+  // La web y la base de datos son públicas, así que los billetes se cifran con AES-GCM usando una clave
+  // que solo conocen los dos viajeros. A la nube solo sube el contenido cifrado.
+  const TKEY = 'sevilla-clave', TPEND = 'sevilla-billetes-pendientes';
+  let tKey = null, tickets = [], tLocked = 0, tLoaded = false;
+  const canCrypt = !!(window.crypto && crypto.subtle);
+  const tBase = () => `${syncUrl}-billetes`;
+  const b64 = (buf) => { const a = new Uint8Array(buf); let t = ''; for (let i = 0; i < a.length; i += 0x8000) t += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000)); return btoa(t); };
+  const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+  async function deriveKey(pass) {
+    const te = new TextEncoder();
+    const base = await crypto.subtle.importKey('raw', te.encode(pass.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('sevilla-billetes:' + SYNC_DEFAULT), iterations: 600000 }, base, 256);
+    return b64(bits);
+  }
+  const importKey = (raw) => crypto.subtle.importKey('raw', unb64(raw), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  async function seal(obj, key = tKey) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
+    return { iv: b64(iv), ct: b64(ct) };
+  }
+  async function unseal(rec, key = tKey) {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(rec.iv) }, key, unb64(rec.ct));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+  const tPending = () => { try { return JSON.parse(lsGet(TPEND) || '[]'); } catch (e) { return []; } };
+  const tSetPending = (list) => lsSet(TPEND, JSON.stringify([...new Set(list)]));
+
+  async function loadTickets() {
+    if (!tKey) return;
+    let local = (await idb('readonly', (st) => st.getAllKeys()).catch(() => [])).filter((k) => String(k).startsWith('t:')).map((k) => k.slice(2));
+    if (syncUrl && navigator.onLine !== false) {
+      try {
+        for (const id of tPending()) {   // subir lo que quedó pendiente sin cobertura
+          const rec = await idb('readonly', (st) => st.get('t:' + id));
+          if (rec) { const r = await fetch(`${tBase()}/${id}.json`, { method: 'PUT', body: JSON.stringify(rec) }); if (!r.ok) throw new Error(r.status); }
+          tSetPending(tPending().filter((x) => x !== id));
+        }
+        const remote = Object.keys((await (await fetch(`${tBase()}.json?shallow=true`)).json()) || {}).filter((k) => k !== '_check');
+        for (const id of remote.filter((x) => !local.includes(x))) {
+          const rec = await (await fetch(`${tBase()}/${id}.json`)).json();
+          if (rec && rec.ct) { await idb('readwrite', (st) => st.put(rec, 't:' + id)); local.push(id); }
+        }
+        for (const id of local.filter((x) => !remote.includes(x))) await idb('readwrite', (st) => st.delete('t:' + id));   // quitado en el otro móvil
+        local = local.filter((x) => remote.includes(x));
+      } catch (e) { /* sin conexión: seguimos con lo que hay en el móvil */ }
+    }
+    const out = [];
+    tLocked = 0;
+    for (const id of local) {
+      try { out.push({ id, ...(await unseal(await idb('readonly', (st) => st.get('t:' + id)))) }); } catch (e) { tLocked++; }
+    }
+    tickets = out.sort((a, b) => (a.date + a.title).localeCompare(b.date + b.title));
+    tLoaded = true;
+  }
+  const refreshTickets = () => loadTickets().then(() => { if (tab === 'resv' && resvFilter === 'tix' && !sheet.open) render(); });
+
+  function viewTickets() {
+    if (!canCrypt) return '<div class="empty">Este navegador no permite cifrar los billetes.</div>';
+    if (!tKey) {
+      return `<div class="panel" style="margin-top:14px">
+        <h3>Billetes privados</h3>
+        <p class="txt">Guardad aquí los PDF o fotos de billetes y entradas. Se cifran en el móvil con una clave que solo sabéis vosotros dos: sin ella nadie puede abrirlos.</p>
+        <div class="actions"><button class="btn primary" data-act="tix-key">Poner la clave</button></div>
+      </div>`;
+    }
+    if (!tLoaded) return '<div class="empty">Cargando billetes…</div>';
+    let last = null;
+    const list = tickets.map((t) => {
+      const head = t.date !== last ? `<div class="section-title">${esc(dayOf(t.date) ? dayOf(t.date).name : 'General')}</div>` : '';
+      last = t.date;
+      return `${head}
+      <div class="panel">
+        <h3>${esc(t.title)}</h3>
+        <div class="sub">${[t.name, t.by && `lo añadió ${t.by}`].filter(Boolean).map(esc).join(' · ') || 'Sin archivo'}</div>
+        ${t.note ? `<div class="mynote">${esc(t.note)}</div>` : ''}
+        <div class="actions">
+          ${t.data ? `<button class="btn primary" data-act="tix-open" data-id="${t.id}">Abrir</button>` : ''}
+          <button class="btn danger" data-act="tix-del" data-id="${t.id}">Quitar</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `${list || '<div class="empty">Aún no hay billetes. Pulsad + arriba para añadir el primero.</div>'}
+      ${tLocked ? `<div class="empty">Hay ${tLocked} billete${tLocked > 1 ? 's' : ''} que no se puede${tLocked > 1 ? 'n' : ''} abrir con la clave de este móvil.</div>` : ''}
+      <div class="empty" style="padding-top:8px">Cifrados con vuestra clave · <button class="link" style="padding:0" data-act="tix-forget">olvidar clave en este móvil</button></div>`;
+  }
+
+  function ticketKeySheet() {
+    openSheet(`
+      <h3>Clave de los billetes</h3>
+      <p class="sheet-p">Elegid una entre los dos y escribidla igual en cada móvil, una sola vez. Mejor una frase que un PIN: si se olvida, los billetes guardados no se pueden recuperar.</p>
+      <label class="f">Clave<input name="pass" required minlength="8" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Mínimo 8 caracteres"></label>
+      ${sheetButtons()}`, async (f) => {
+      try {
+        const raw = await deriveKey(f.pass);
+        const key = await importKey(raw);
+        if (syncUrl && navigator.onLine !== false) {
+          const check = await fetch(`${tBase()}/_check.json`).then((r) => r.json()).catch(() => null);
+          if (check && check.ct) {
+            try { await unseal(check, key); } catch (e) { toast('Esa clave no coincide con la del otro móvil'); return; }
+          } else {
+            await fetch(`${tBase()}/_check.json`, { method: 'PUT', body: JSON.stringify(await seal({ ok: 1 }, key)) }).catch(() => {});
+          }
+        }
+        tKey = key; lsSet(TKEY, raw); tLoaded = false;
+        await loadTickets();
+        toast('Clave guardada en este móvil');
+      } catch (e) { toast('No se pudo guardar la clave'); }
+    });
+  }
+
+  function ticketSheet() {
+    if (!tKey) return ticketKeySheet();
+    openSheet(`
+      <h3>Nuevo billete</h3>
+      <label class="f">Qué es<input name="title" required placeholder="AVE ida, entrada Alcázar…"></label>
+      <label class="f">Día<select name="date">${dayOptions(selDay, true).replace('Antes del viaje', 'General')}</select></label>
+      <label class="f">Archivo (PDF o foto)<input type="file" name="file" accept="image/*,application/pdf"></label>
+      <label class="f">Localizador o notas (opcional)<textarea name="note"></textarea></label>
+      ${sheetButtons()}`, async (f, v, form) => {
+      const file = form.querySelector('[name=file]').files[0];
+      let data = '', name = '', type = '';
+      try {
+        if (file) {
+          const isImg = file.type.startsWith('image/');
+          if (!isImg && file.size > 6e6) { toast('El archivo pasa de 6 MB'); return; }
+          data = await blobToData(isImg ? await shrink(file, 2000) : file);
+          name = file.name; type = isImg ? 'image/jpeg' : file.type;
+        }
+        const id = 't' + uid();
+        const rec = await seal({ title: f.title.trim(), date: f.date, note: f.note.trim(), name, type, data, by: me, ts: new Date().toISOString() });
+        await idb('readwrite', (st) => st.put(rec, 't:' + id));
+        tSetPending([...tPending(), id]);
+        await loadTickets();
+        toast(tPending().includes(id) && syncUrl ? 'Guardado · se enviará al otro móvil con cobertura' : 'Billete guardado');
+      } catch (e) { toast('No se pudo guardar el billete'); }
+    });
+  }
+
+  async function openTicket(id) {
+    const t = tickets.find((x) => x.id === id);
+    if (!t || !t.data) return;
+    if (t.type.startsWith('image/')) {
+      $('#viewerImg').src = t.data;
+      $('#viewer').showModal();
+      return;
+    }
+    const url = URL.createObjectURL(await (await fetch(t.data)).blob());
+    const a = document.createElement('a');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  async function deleteTicket(id) {
+    if (!confirm('¿Quitar este billete? Se quita también en el otro móvil.')) return;
+    await idb('readwrite', (st) => st.delete('t:' + id)).catch(() => {});
+    tSetPending(tPending().filter((x) => x !== id));
+    if (syncUrl) await fetch(`${tBase()}/${id}.json`, { method: 'DELETE' }).catch(() => {});
+    await loadTickets();
+    render();
   }
 
   // ---------- Diario ----------
@@ -809,9 +973,16 @@
     switch (el.dataset.act) {
       case 'day': goDay(id); break;
       case 'go': tab = id; render('enter'); window.scrollTo(0, 0); break;
-      case 'plus': ({ plan: itemSheet, resv: editResv, diary: editJournal, money: addExpense }[tab] || (() => {}))(); break;
+      case 'plus': ({ plan: itemSheet, resv: () => (resvFilter === 'tix' ? ticketSheet() : editResv()), diary: editJournal, money: addExpense }[tab] || (() => {}))(); break;
       case 'me': me = id; lsSet('sevilla-me', me); render(); break;
-      case 'resv-filter': resvFilter = id; render(); break;
+      case 'resv-filter': resvFilter = id; render(); if (id === 'tix') refreshTickets(); break;
+      case 'tix-key': ticketKeySheet(); break;
+      case 'tix-open': openTicket(id); break;
+      case 'tix-del': deleteTicket(id); break;
+      case 'tix-close': $('#viewer').close(); break;
+      case 'tix-forget':
+        if (confirm('¿Olvidar la clave en este móvil? Los billetes siguen guardados, pero habrá que volver a escribirla para verlos.')) { tKey = null; lsSet(TKEY, null); tickets = []; tLoaded = false; render(); }
+        break;
       case 'toggle': if (open.has(id)) open.delete(id); else { open.add(id); justOpen = id; } render(); break;
       case 'done':
         if (state.done[id]) delete state.done[id];
@@ -908,6 +1079,7 @@
     if (url && url !== syncUrl) { setSync(url); setTimeout(() => toast('Sincronización activada'), 300); }
   }
   if (syncUrl && !es) connect();
+  if (canCrypt && lsGet(TKEY)) importKey(lsGet(TKEY)).then((k) => { tKey = k; return refreshTickets(); }).catch(() => {});
   window.addEventListener('online', () => { if (syncUrl && (!es || es.readyState === 2)) connect(); else flush(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden && syncUrl && (!es || es.readyState === 2)) connect(); });
   render();

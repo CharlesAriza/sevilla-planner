@@ -364,3 +364,13 @@ label.f > * { text-transform: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Visor de billetes: fondo blanco y a pantalla completa para que el lector de QR lo lea bien */
+.viewer {
+  border: 0; padding: calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 12px);
+  margin: 0; width: 100vw; height: 100dvh; max-width: none; max-height: none; background: #fff;
+}
+.viewer[open] { display: flex; flex-direction: column; gap: 12px; align-items: center; animation: fade .2s ease-out; }
+.viewer img { flex: 1; min-height: 0; max-width: 100%; object-fit: contain; }
+.viewer .btn { flex: none; min-width: 140px; min-height: 46px; }
+.seg button { padding: 0 4px; white-space: nowrap; }
