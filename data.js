@@ -4,7 +4,8 @@
 
 const TRIP = {
   title: 'Sevilla',
-  subtitle: '7 – 11 de noviembre de 2026',
+  subtitle: '7 – 11 nov 2026',
+  people: ['Albert', 'Nuria'],
   tagline: '2 personas · ritmo relajado · Córdoba el martes',
   start: '2026-11-07',
   end: '2026-11-11',

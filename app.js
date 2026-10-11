@@ -83,9 +83,17 @@
     else shadow = setPath(shadow, segs, data);
     const merged = JSON.parse(JSON.stringify(shadow));
     for (const [p, v] of Object.entries(pending)) setPath(merged, p.split('/'), v);
+    const before = JSON.stringify(canon(toTree(state))), oldDone = state.done;
     state = fromTree(merged);
     persist();
-    if (sheet.open) dirty = true; else render();
+    const changed = JSON.stringify(canon(toTree(state))) !== before;
+    if (changed && (segs.length || isPatch)) {
+      const fresh = Object.keys(state.done).filter((id) => !oldDone[id]);
+      const it = fresh.length && findItem(fresh[0]);
+      toast(fresh.length ? `${other()} ha marcado «${it ? it.title : 'una actividad'}»` : `${other()} ha hecho cambios`);
+    }
+    // El eco de nuestros propios cambios no altera nada: no repintamos para no cortar animaciones.
+    if (changed) { if (sheet.open) dirty = true; else render(); }
     flush();
   }
 
@@ -190,6 +198,10 @@
   const KINDS = { visit: 'Visita', walk: 'Paseo', food: 'Comida', train: 'Transporte', show: 'Espectáculo', stay: 'Alojamiento / traslado', custom: 'Otro' };
 
   const today = ymd(now());
+  const PEOPLE = TRIP.people || [];
+  let me = PEOPLE.includes(lsGet('sevilla-me')) ? lsGet('sevilla-me') : '';
+  const other = () => (me && PEOPLE.find((p) => p !== me)) || 'El otro móvil';
+  let resvFilter = 'todo', flash = null, justOpen = null;
   let tab = 'plan';
   let selDay = dayOf(today) ? today : DAYS[0].date;
   const open = new Set();
@@ -293,6 +305,43 @@
     return `<span class="range">${it.start ? esc(it.start) : '…'}<br>${it.end ? esc(it.end) : '…'}</span><small>aprox.</small>`;
   }
 
+  function hero(items, cur, next) {
+    if (today < TRIP.start) {
+      const diff = Math.round((new Date(TRIP.start + 'T00:00') - new Date(today + 'T00:00')) / 864e5);
+      const pend = bookings().filter((b) => resvState(b) === 'todo').length;
+      return `<div class="hero">
+        <div class="hero-k">${diff === 1 ? 'Mañana empieza el viaje' : `Faltan ${diff} días`}</div>
+        <div class="hero-t">${pend ? `${pend} reserva${pend > 1 ? 's' : ''} por hacer` : 'Todo reservado'}</div>
+        ${pend ? '<div class="actions"><button class="btn" data-act="go" data-id="resv">Ver reservas</button></div>' : ''}
+      </div>`;
+    }
+    if (selDay !== today) return '';
+    const it = items.find((i) => i.id === (cur || next));
+    if (!it) {
+      return `<div class="hero">
+        <div class="hero-k">Hoy</div>
+        <div class="hero-t">No queda nada con hora por delante</div>
+        <div class="actions">
+          <a class="btn" target="_blank" rel="noopener" href="${dirUrl(TRIP.stay.address)}">Volver al alojamiento</a>
+          <button class="btn" data-act="j-add">Apuntar un momento</button>
+        </div>
+      </div>`;
+    }
+    const d = mins(it.start) - (now().getHours() * 60 + now().getMinutes());
+    const rel = d < 60 ? `en ${d} min` : `en ${Math.floor(d / 60)} h${d % 60 ? ` ${d % 60} min` : ''}`;
+    const after = cur && next && items.find((i) => i.id === next);
+    const map = it.map || (it.custom && it.zone);
+    return `<div class="hero">
+      <div class="hero-k">${cur ? `Ahora${it.end ? ` · hasta las ${esc(it.end)}` : ''}` : `Siguiente · ${esc(it.start)} · ${rel}`}</div>
+      <div class="hero-t">${esc(it.title)}</div>
+      ${after ? `<div class="hero-sub">Después: ${esc(after.start)} · ${esc(after.title)}</div>` : ''}
+      <div class="actions">
+        ${map ? `<a class="btn" target="_blank" rel="noopener" href="${dirUrl(map)}">Cómo llegar</a>` : ''}
+        <button class="btn" data-act="done" data-id="${it.id}">Hecho</button>
+      </div>
+    </div>`;
+  }
+
   function viewPlan() {
     const day = dayInfo(dayOf(selDay));
     const items = itemsFor(day);
@@ -316,7 +365,7 @@
       const my = state.notes[it.id];
       const map = it.map || (it.custom && it.zone);
       return `
-      <li class="item k-${it.kind} ${isDone ? 'done' : ''} ${it.id === cur ? 'is-now' : ''}">
+      <li class="item k-${it.kind} ${isDone ? 'done' : ''} ${it.id === cur ? 'is-now' : ''} ${isOpen ? 'open' : ''} ${flash === it.id ? 'pop' : ''}">
         <div class="item-time ${it.fixed ? 'fixed' : 'flex'}">${timeCell(it)}</div>
         <div class="card">
           <div class="card-main">
@@ -328,7 +377,7 @@
             <button class="check" data-act="done" data-id="${it.id}" aria-label="${isDone ? 'Marcar como pendiente' : 'Marcar como hecho'}" aria-pressed="${isDone}"><i></i></button>
           </div>
           ${isOpen ? `
-          <div class="detail">
+          <div class="detail ${justOpen === it.id ? 'anim' : ''}">
             ${it.note ? `<p>${esc(it.note)}</p>` : ''}
             ${my ? `<div class="mynote"><b>Nuestra nota</b>${esc(my)}</div>` : ''}
             <div class="actions">
@@ -341,17 +390,16 @@
       </li>`;
     }).join('');
 
-    return `${dayChips()}
+    return `${hero(items, cur, next)}
       <div class="day-head">
         <div class="row"><h2>${esc(day.name)} · ${esc(day.title)}</h2><button class="link" data-act="day-edit">Editar</button></div>
         <p>${esc(day.summary)}</p>
         <div class="progress"><i style="width:${items.length ? (nDone / items.length) * 100 : 0}%"></i></div>
-        <div class="progress-label"><span>${nDone} de ${items.length} hechas</span><span>Gris = horquilla orientativa</span></div>
+        <div class="progress-label"><span>${nDone} de ${items.length} hechas</span><span>Gris = hora orientativa</span></div>
       </div>
       <ul class="timeline">${li}</ul>
-      ${items.length ? '' : '<div class="empty">Día vacío. Añadid lo que queráis.</div>'}
+      ${items.length ? '' : '<div class="empty">Día vacío. Pulsad + arriba para añadir algo.</div>'}
       <div class="add-row">
-        <button class="btn ghost block" data-act="add">+ Añadir a este día</button>
         ${hidden ? `<button class="btn ghost block" data-act="restore">Recuperar ${hidden} actividad${hidden > 1 ? 'es' : ''} quitada${hidden > 1 ? 's' : ''}</button>` : ''}
       </div>`;
   }
@@ -369,7 +417,8 @@
     const need = all.filter((b) => resvState(b) !== 'skip');
     const ok = need.filter((b) => resvState(b) === 'ok').length;
     let last = '';
-    const list = all.map((b) => {
+    const shown = resvFilter === 'todo' ? all.filter((b) => resvState(b) === 'todo') : all;
+    const list = shown.map((b) => {
       const st = resvState(b);
       const head = b.date !== last ? `<div class="section-title">${esc(dayOf(b.date).name)}</div>` : '';
       last = b.date;
@@ -393,11 +442,15 @@
     return `
       <div class="day-head">
         <h2>Reservas y billetes</h2>
-        <p>Tocad el estado para cambiarlo. Todo se puede editar, quitar o añadir.</p>
+        <p>Tocad el estado para cambiarlo.</p>
         <div class="progress"><i style="width:${need.length ? (ok / need.length) * 100 : 0}%"></i></div>
         <div class="progress-label"><span>${ok} de ${need.length} listas</span><span>${need.length - ok} pendiente${need.length - ok === 1 ? '' : 's'}</span></div>
-      </div>${list}
-      <button class="btn primary block" data-act="resv-add" style="margin-top:16px">Añadir reserva</button>`;
+      </div>
+      <div class="seg" style="margin-top:14px">
+        <button class="${resvFilter === 'todo' ? 'on' : ''}" data-act="resv-filter" data-id="todo">Pendientes · ${need.length - ok}</button>
+        <button class="${resvFilter === 'all' ? 'on' : ''}" data-act="resv-filter" data-id="all">Todas · ${all.length}</button>
+      </div>
+      ${list || '<div class="empty">No queda nada por reservar.</div>'}`;
   }
 
   // ---------- Diario ----------
@@ -413,17 +466,17 @@
         <div class="row"><div>
           ${e.place ? `<h3>${esc(e.place)}</h3>` : ''}
           ${e.stars ? `<div class="stars">${'★'.repeat(e.stars)}${'☆'.repeat(5 - e.stars)}</div>` : ''}
+          ${e.by ? `<div class="sub">${esc(e.by)}</div>` : ''}
         </div><button class="x" data-act="j-edit" data-id="${e.id}" aria-label="Editar" style="width:auto;font-size:15px">Editar</button></div>
         ${e.text ? `<p class="txt" style="margin-top:2px">${esc(e.text)}</p>` : ''}
         ${e.photo ? `<img data-photo="${esc(e.photo)}" alt="Foto del momento">` : ''}
       </div></div>`;
     }).join('');
-    return `${dayChips()}
-      <div class="day-head">
+    return `
+      <div class="day-head" style="padding-bottom:14px">
         <h2>Diario · ${esc(day.name)}</h2>
-        <p>Lo que marcáis como hecho en el plan aparece aquí solo. Añadid momentos, notas y fotos.</p>
+        <p>Lo que marcáis como hecho aparece aquí solo. Con + añadís momentos, notas y fotos.</p>
       </div>
-      <button class="btn primary block" data-act="j-add" style="margin:10px 0 16px">Añadir momento</button>
       ${list || '<div class="empty">Todavía no hay nada apuntado este día.</div>'}`;
   }
 
@@ -437,15 +490,21 @@
       <div class="panel" style="padding:4px 14px">${list.map((e) => `
         <div class="exp"><div>${esc(e.what)}${e.who ? `<small>Pagó ${esc(e.who)}</small>` : ''}</div><b>${euro(e.amount)}</b>
         <button class="x" data-act="e-del" data-id="${e.id}" aria-label="Borrar gasto">×</button></div>`).join('')}</div>`;
+    const paid = PEOPLE.map((p) => state.expenses.filter((e) => e.who === p).reduce((s, e) => s + e.amount, 0));
+    const gap = PEOPLE.length === 2 ? (paid[0] - paid[1]) / 2 : 0;
+    const settle = !(paid[0] || paid[1]) ? '' : `<div class="panel settle">
+        <h3>${Math.abs(gap) < 0.005 ? 'Estáis en paz' : `${esc(PEOPLE[gap > 0 ? 1 : 0])} debe ${euro(Math.abs(gap))} a ${esc(PEOPLE[gap > 0 ? 0 : 1])}`}</h3>
+        <div class="sub">${PEOPLE.map((p, i) => `${esc(p)} ha pagado ${euro(paid[i])}`).join(' · ')}</div>
+      </div>`;
     return `
       <div class="stats">
         <div class="panel"><div class="sub">Total</div><div class="big-num">${euro(total)}</div></div>
         <div class="panel"><div class="sub">Por persona</div><div class="big-num">${euro(total / 2)}</div></div>
       </div>
-      <button class="btn primary block" data-act="e-add" style="margin:14px 0 4px">Añadir gasto</button>
+      ${settle}
       ${other.length ? group('Antes del viaje', other) : ''}
       ${byDay.map((g) => group(g.d.name, g.list)).join('')}
-      ${state.expenses.length ? '' : '<div class="empty">Sin gastos apuntados. Los AVE ya pagados (67,50 € ida, 33,80 € vuelta aprox.) podéis añadirlos como «antes del viaje».</div>'}`;
+      ${state.expenses.length ? '' : '<div class="empty">Sin gastos apuntados. Pulsad + arriba para añadir el primero.</div>'}`;
   }
 
   // ---------- Info ----------
@@ -458,6 +517,10 @@
         <div class="sub">${esc(TRIP.tagline)}</div>
         <div class="actions"><a class="btn primary" target="_blank" rel="noopener" href="${dirUrl(TRIP.stay.address)}">Volver al alojamiento</a></div>
       </div>
+      <div class="section-title">Este móvil es de</div>
+      <div class="seg">${PEOPLE.map((p) => `<button class="${me === p ? 'on' : ''}" data-act="me" data-id="${esc(p)}">${esc(p)}</button>`).join('')}</div>
+      <div class="section-title">Apariencia</div>
+      <div class="seg">${[['light', 'Claro'], ['dark', 'Oscuro'], ['auto', 'Automático']].map(([k, n]) => `<button class="${theme === k ? 'on' : ''}" data-act="theme" data-id="${k}">${n}</button>`).join('')}</div>
       <div class="section-title">Trenes confirmados</div>
       ${trains.map((b) => `<div class="panel"><h3>${esc(b.title)}</h3><div class="sub">${esc(dayOf(b.date).name)} · ${esc(b.time)}</div><p class="txt">${esc(b.note)}</p></div>`).join('')}
       <div class="section-title">Horarios de monumentos</div>
@@ -468,8 +531,6 @@
       </div>`).join('')}
       <div class="section-title">Consejos</div>
       <div class="panel"><ul class="tips">${TIPS.map((t) => `<li>${esc(t)}</li>`).join('')}</ul></div>
-      <div class="section-title">Apariencia</div>
-      <div class="seg">${[['light', 'Claro'], ['dark', 'Oscuro'], ['auto', 'Automático']].map(([k, n]) => `<button class="${theme === k ? 'on' : ''}" data-act="theme" data-id="${k}">${n}</button>`).join('')}</div>
       <div class="section-title">Sincronización entre los dos móviles</div>
       <div class="panel">${syncUrl ? `
         <h3>${online ? (pendingCount() ? 'Enviando cambios…' : 'Sincronizado') : 'Sin conexión'}</h3>
@@ -501,8 +562,12 @@
 
   // ---------- Render ----------
   const VIEWS = { plan: viewPlan, resv: viewResv, diary: viewDiary, money: viewMoney, info: viewInfo };
-  function render() {
-    $('#view').innerHTML = VIEWS[tab]();
+  // anim: 'enter' (cambio de pestaña), 'from-r' / 'from-l' (cambio de día). Sin anim = refresco en el sitio.
+  function render(anim) {
+    const chips = tab === 'plan' || tab === 'diary' ? dayChips() : '';
+    $('#view').innerHTML = `${chips}<div class="page ${anim || ''}">${VIEWS[tab]()}</div>`;
+    $('#plusBtn').hidden = tab === 'info';
+    flash = justOpen = null;
     document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
     document.querySelectorAll('img[data-photo]').forEach(async (img) => {
       const u = await photoUrl(img.dataset.photo).catch(() => null);
@@ -546,15 +611,22 @@
     sheet.returnValue = '';
     sheet.showModal();
   }
-  sheet.addEventListener('close', async () => {
-    const v = sheet.returnValue, h = onSheet;
+  // Guardamos en el propio envío del formulario (no en el evento «close», que puede llegar con retraso).
+  $('#sheetBody').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = (e.submitter && e.submitter.value) || 'ok', h = onSheet, form = e.target;
     onSheet = null;
-    if (h && v && v !== 'cancel') {
-      const form = $('#sheetBody');
-      await h(Object.fromEntries(new FormData(form)), v, form);
-      save(); render();
-    } else if (dirty) render();
+    const data = Object.fromEntries(new FormData(form));
+    sheet.close();
+    if (h && v !== 'cancel') { await h(data, v, form); save(); }
     dirty = false;
+    render();
+  });
+  // Cierre con Esc o tocando fuera.
+  sheet.addEventListener('close', () => {
+    if (sheet.open) return;
+    onSheet = null;
+    if (dirty) { dirty = false; render(); }
   });
   sheet.addEventListener('click', (e) => { if (e.target === sheet) sheet.close('cancel'); });
   const sheetButtons = (del) => `<div class="sheet-actions">
@@ -673,7 +745,7 @@
         } catch (err) { toast('No se pudo guardar la foto'); }
       }
       if (!f.place.trim() && !f.text.trim() && !photo) return;
-      const entry = { id: e ? e.id : 'j' + uid(), date: selDay, ts: `${selDay}T${f.time || '12:00'}:00`, place: f.place.trim(), text: f.text.trim(), stars: +f.stars, photo };
+      const entry = { id: e ? e.id : 'j' + uid(), date: selDay, ts: `${selDay}T${f.time || '12:00'}:00`, place: f.place.trim(), text: f.text.trim(), stars: +f.stars, photo, by: (e && e.by) || me };
       const cur = e && state.journal.find((j) => j.id === e.id);
       if (cur) Object.assign(cur, entry); else state.journal.push(entry);
     });
@@ -687,7 +759,7 @@
       <label class="f">Concepto<input name="what" required placeholder="Comida, taxi, entradas…"></label>
       <div class="two">
         <label class="f">Importe (€)<input name="amount" required inputmode="decimal" placeholder="0,00"></label>
-        <label class="f">Quién pagó<input name="who" placeholder="Opcional"></label>
+        <label class="f">Quién pagó<select name="who">${PEOPLE.map((p) => `<option ${p === me ? 'selected' : ''}>${esc(p)}</option>`).join('')}<option value="" ${me ? '' : 'selected'}>A medias</option></select></label>
       </div>
       <label class="f">Día<select name="date">${dayOptions(dayOf(today) ? today : 'pre', true)}</select></label>
       ${sheetButtons()}`, (f) => {
@@ -730,16 +802,25 @@
   // ---------- Eventos ----------
   document.addEventListener('click', (e) => {
     const tb = e.target.closest('.tab');
-    if (tb) { tab = tb.dataset.tab; render(); window.scrollTo(0, 0); return; }
+    if (tb) { if (tab !== tb.dataset.tab) { tab = tb.dataset.tab; render('enter'); } window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
     const el = e.target.closest('[data-act]');
     if (!el) return;
     const id = el.dataset.id;
     switch (el.dataset.act) {
-      case 'day': selDay = id; render(); window.scrollTo(0, 0); break;
-      case 'toggle': open.has(id) ? open.delete(id) : open.add(id); render(); break;
+      case 'day': goDay(id); break;
+      case 'go': tab = id; render('enter'); window.scrollTo(0, 0); break;
+      case 'plus': ({ plan: itemSheet, resv: editResv, diary: editJournal, money: addExpense }[tab] || (() => {}))(); break;
+      case 'me': me = id; lsSet('sevilla-me', me); render(); break;
+      case 'resv-filter': resvFilter = id; render(); break;
+      case 'toggle': if (open.has(id)) open.delete(id); else { open.add(id); justOpen = id; } render(); break;
       case 'done':
         if (state.done[id]) delete state.done[id];
-        else { state.done[id] = selDay === today ? now().toISOString() : `${selDay}T23:59:00`; toast('Hecho · apuntado en el diario'); }
+        else {
+          state.done[id] = selDay === today ? now().toISOString() : `${selDay}T23:59:00`;
+          flash = id;
+          if (navigator.vibrate) navigator.vibrate(12);
+          toast('Hecho · apuntado en el diario');
+        }
         save(); render(); break;
       case 'edit': itemSheet(id); break;
       case 'add': itemSheet(); break;
@@ -788,11 +869,38 @@
         break;
     }
   });
+  function goDay(date) {
+    if (date === selDay) return;
+    const dir = DAYS.findIndex((d) => d.date === date) > DAYS.findIndex((d) => d.date === selDay) ? 'from-r' : 'from-l';
+    selDay = date;
+    render(dir);
+    window.scrollTo(0, 0);
+  }
+  // Deslizar a izquierda/derecha cambia de día en Plan y Diario.
+  let touch = null;
+  $('#view').addEventListener('touchstart', (e) => { touch = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null; }, { passive: true });
+  $('#view').addEventListener('touchend', (e) => {
+    if (!touch || (tab !== 'plan' && tab !== 'diary')) return;
+    const dx = e.changedTouches[0].clientX - touch.x, dy = e.changedTouches[0].clientY - touch.y;
+    touch = null;
+    if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 2) return;
+    const next = DAYS[DAYS.findIndex((d) => d.date === selDay) + (dx < 0 ? 1 : -1)];
+    if (next) goDay(next.date);
+  }, { passive: true });
+
   document.addEventListener('change', (e) => {
     if (e.target.id === 'importFile' && e.target.files[0]) importAll(e.target.files[0]);
   });
 
   header();
+  // La primera vez preguntamos de quién es el móvil (para «quién pagó» y firmar el diario).
+  if (!me && PEOPLE.length && !lsGet('sevilla-me')) {
+    lsSet('sevilla-me', '-');
+    openSheet(`<h3>¿De quién es este móvil?</h3>
+      <p class="sheet-p">Así sabemos quién paga cada gasto y quién apunta cada momento.</p>
+      <div class="sheet-actions">${PEOPLE.map((p) => `<button class="btn primary" value="${esc(p)}">${esc(p)}</button>`).join('')}</div>
+      <button class="btn ghost" value="cancel" formnovalidate>Ahora no</button>`, (f, v) => { me = v; lsSet('sevilla-me', me); });
+  }
   // Enlace compartido desde el otro móvil: .../#sync=<url>
   if (location.hash.startsWith('#sync=')) {
     const url = parseSync(location.hash);
