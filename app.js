@@ -30,6 +30,9 @@
   let shadow = {};   // último estado que sabemos que está en la nube
   try { shadow = JSON.parse(lsGet(SHADOW_KEY) || '{}'); } catch (e) { /* vacío */ }
   let es = null, online = false, pushing = false, retryT, dirty = false;
+  // Firmas de nuestros envíos recientes: su eco no debe tratarse como un cambio del otro móvil.
+  const own = [];
+  const sig = (up) => JSON.stringify(Object.keys(up || {}).sort().map((k) => [k, canon(up[k]) ?? null]));
 
   const canon = (v) => {
     if (v === null || v === undefined) return undefined;
@@ -103,6 +106,8 @@
     const up = diff(toTree(state), shadow);
     if (!Object.keys(up).length) { flushPhotos(); return; }
     pushing = true;
+    const mine = sig(up);
+    own.push(mine);
     try {
       const r = await fetch(syncUrl + '.json', { method: 'PATCH', body: JSON.stringify(up) });
       if (!r.ok) throw new Error(r.status);
@@ -112,6 +117,7 @@
       flush();
     } catch (e) {
       pushing = false;
+      if (own.includes(mine)) own.splice(own.indexOf(mine), 1);
       clearTimeout(retryT); retryT = setTimeout(flush, 5000);
       syncDot();
     }
@@ -119,12 +125,16 @@
 
   function connect() {
     if (es) es.close();
-    es = null; online = false;
+    es = null; online = false; own.length = 0;
     syncDot();
     if (!syncUrl) return;
     es = new EventSource(syncUrl + '.json');
     es.addEventListener('put', (e) => { const d = JSON.parse(e.data); online = true; onRemote(d.path, d.data, false); });
-    es.addEventListener('patch', (e) => { const d = JSON.parse(e.data); onRemote(d.path, d.data, true); });
+    es.addEventListener('patch', (e) => {
+      const d = JSON.parse(e.data), i = d.path === '/' ? own.indexOf(sig(d.data)) : -1;
+      if (i >= 0) { own.splice(i, 1); return; }
+      onRemote(d.path, d.data, true);
+    });
     es.onerror = () => {
       online = false; syncDot();
       if (es && es.readyState === 2) { clearTimeout(retryT); retryT = setTimeout(connect, 15000); }
@@ -201,7 +211,7 @@
   const PEOPLE = TRIP.people || [];
   let me = PEOPLE.includes(lsGet('sevilla-me')) ? lsGet('sevilla-me') : '';
   const other = () => (me && PEOPLE.find((p) => p !== me)) || 'El otro móvil';
-  let resvFilter = 'todo', flash = null, justOpen = null;
+  let resvFilter = 'todo', flash = null, justOpen = null, editMode = false;
   let tab = 'plan';
   let selDay = dayOf(today) ? today : DAYS[0].date;
   const open = new Set();
@@ -261,7 +271,12 @@
       .filter((it) => it.date === day.date)
       .map((it) => { const key = mins(it.start) ?? prev + 0.1; prev = key; return { ...it, key }; });
     const custom = state.custom.filter((c) => c.date === day.date).map((c) => ({ kind: 'custom', ...c, custom: true, key: mins(c.start) ?? 9999 }));
-    return [...base, ...custom].sort((a, b) => a.key - b.key);
+    const list = [...base, ...custom].sort((a, b) => a.key - b.key);
+    // Si se ha reordenado a mano, manda ese orden; lo nuevo va al final.
+    const order = String((state.days[day.date] || {}).order || '').split(',').filter(Boolean);
+    if (!order.length) return list;
+    const pos = (it) => (order.includes(it.id) ? order.indexOf(it.id) : order.length);
+    return list.map((it, i) => [it, i]).sort((a, b) => pos(a[0]) - pos(b[0]) || a[1] - b[1]).map((x) => x[0]);
   }
   const findItem = (id) => {
     const c = state.custom.find((x) => x.id === id);
@@ -349,9 +364,9 @@
     const nDone = items.filter((i) => state.done[i.id]).length;
     const hidden = ALL.filter((it) => state.hidden[it.id] && it.date === day.date).length;
 
-    const li = items.map((it) => {
+    const li = items.map((it, idx) => {
       const isDone = !!state.done[it.id];
-      const isOpen = open.has(it.id);
+      const isOpen = !editMode && open.has(it.id);
       const meta = [it.zone, it.move, it.dur && fmtDur(it.dur), it.food].filter(Boolean).map(esc);
       const badges = [
         it.id === cur && '<span class="badge now">Ahora</span>',
@@ -374,8 +389,14 @@
               ${meta.length ? `<div class="meta">${meta.join(' · ')}</div>` : ''}
               ${badges.length ? `<div class="badges">${badges.join('')}</div>` : ''}
             </button>
-            <button class="check" data-act="done" data-id="${it.id}" aria-label="${isDone ? 'Marcar como pendiente' : 'Marcar como hecho'}" aria-pressed="${isDone}"><i></i></button>
+            ${editMode ? '' : `<button class="check" data-act="done" data-id="${it.id}" aria-label="${isDone ? 'Marcar como pendiente' : 'Marcar como hecho'}" aria-pressed="${isDone}"><i></i></button>`}
           </div>
+          ${editMode ? `<div class="edit-bar">
+            <button data-act="mv" data-id="${it.id}" data-dir="-1" aria-label="Subir" ${idx === 0 ? 'disabled' : ''}>↑</button>
+            <button data-act="mv" data-id="${it.id}" data-dir="1" aria-label="Bajar" ${idx === items.length - 1 ? 'disabled' : ''}>↓</button>
+            <button data-act="edit" data-id="${it.id}">Editar</button>
+            <button class="del" data-act="rm" data-id="${it.id}">Quitar</button>
+          </div>` : ''}
           ${isOpen ? `
           <div class="detail ${justOpen === it.id ? 'anim' : ''}">
             ${it.note ? `<p>${esc(it.note)}</p>` : ''}
@@ -390,16 +411,21 @@
       </li>`;
     }).join('');
 
-    return `${hero(items, cur, next)}
+    return `${editMode ? '' : hero(items, cur, next)}
       <div class="day-head">
-        <div class="row"><h2>${esc(day.name)} · ${esc(day.title)}</h2><button class="link" data-act="day-edit">Editar</button></div>
+        <div class="row"><h2>${esc(day.name)} · ${esc(day.title)}</h2><button class="link" data-act="edit-mode">${editMode ? 'Listo' : 'Editar día'}</button></div>
         <p>${esc(day.summary)}</p>
+        ${editMode ? `<div class="actions" style="margin-top:10px">
+          <button class="btn" data-act="day-edit">Título y resumen</button>
+          ${day.order ? '<button class="btn" data-act="sort-time">Ordenar por hora</button>' : ''}
+        </div>` : ''}
         <div class="progress"><i style="width:${items.length ? (nDone / items.length) * 100 : 0}%"></i></div>
         <div class="progress-label"><span>${nDone} de ${items.length} hechas</span><span>Gris = hora orientativa</span></div>
       </div>
       <ul class="timeline">${li}</ul>
-      ${items.length ? '' : '<div class="empty">Día vacío. Pulsad + arriba para añadir algo.</div>'}
+      ${items.length ? '' : '<div class="empty">Día vacío.</div>'}
       <div class="add-row">
+        <button class="add-big" data-act="add">+ Añadir sitio o actividad</button>
         ${hidden ? `<button class="btn ghost block" data-act="restore">Recuperar ${hidden} actividad${hidden > 1 ? 'es' : ''} quitada${hidden > 1 ? 's' : ''}</button>` : ''}
       </div>`;
   }
@@ -800,14 +826,37 @@
   const dayOptions = (sel, withPre) => (withPre ? `<option value="pre" ${sel === 'pre' ? 'selected' : ''}>Antes del viaje</option>` : '')
     + DAYS.map((d) => `<option value="${d.date}" ${d.date === sel ? 'selected' : ''}>${d.name}</option>`).join('');
 
-  // Formulario único para crear o editar cualquier actividad del plan.
+  // ---------- Formulario de actividad ----------
+  const DURS = [15, 30, 45, 60, 75, 90, 105, 120, 150, 180, 240];
+  const ZONES = ['Centro', 'Santa Cruz', 'Arenal', 'Encarnación', 'Alameda', 'Macarena', 'Triana', 'María Luisa', 'Santa Justa', 'Córdoba · Judería', 'Córdoba · Mezquita', 'Córdoba · Ribera', 'Córdoba · Centro'];
+  const MOVES = ['A pie', 'Taxi', 'Bus', 'Tranvía', 'Metro', 'Tren', 'AVE', 'Bici'];
+  const FOODS = ['Desayuno', 'Café', 'Comida', 'Aperitivo', 'Merienda', 'Cena'];
+  const RESVS = ['Pendiente', 'Confirmado', 'Con reserva', 'Opcional'];
+  const PRIOS = { A: 'Imprescindible', B: 'Recomendable', C: 'Opcional' };
+  // Desplegable con «Otra…», que deja escribir un valor que no esté en la lista.
+  function pick(name, label, options, value) {
+    const known = !value || options.includes(value);
+    return `<label class="f">${label}<select name="${name}" data-other>
+      <option value="">—</option>
+      ${options.map((o) => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+      <option value="__other" ${known ? '' : 'selected'}>Otra…</option></select>
+      <input name="${name}_other" value="${known ? '' : esc(value)}" placeholder="Escribid aquí" ${known ? 'hidden' : ''}></label>`;
+  }
+  const picked = (f, name) => (f[name] === '__other' ? (f[name + '_other'] || '').trim() : f[name] || '');
+  const addMin = (t, m) => { const x = Math.min(mins(t) + m, 23 * 60 + 59); return `${String(Math.floor(x / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`; };
+
   function itemSheet(id) {
-    const it = id ? findItem(id) : { date: selDay, kind: 'custom', custom: true };
+    const it = id ? findItem(id) : { date: selDay, kind: 'visit', custom: true };
     if (!it) return;
     const v = (k) => esc(it[k] || '');
+    const groups = [...new Set(CATALOG.map((c) => c.group))];
     openSheet(`
       <h3>${id ? 'Editar actividad' : 'Añadir al plan'}</h3>
-      <label class="f">Qué<input name="title" required value="${v('title')}" placeholder="Tapas en…, compras, descanso…"></label>
+      <label class="f">Elegir de la lista<select name="catalog">
+        <option value="">${id ? '— no cambiar —' : 'Escribir uno nuevo…'}</option>
+        ${groups.map((g) => `<optgroup label="${esc(g)}">${CATALOG.map((c, i) => (c.group === g ? `<option value="${i}">${esc(c.name)}</option>` : '')).join('')}</optgroup>`).join('')}
+      </select></label>
+      <label class="f">Qué<input name="title" required value="${v('title')}" placeholder="Sitio o actividad"></label>
       <div class="two">
         <label class="f">Día<select name="date">${dayOptions(it.date)}</select></label>
         <label class="f">Tipo<select name="kind">${Object.entries(KINDS).map(([k, n]) => `<option value="${k}" ${k === it.kind ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
@@ -816,21 +865,29 @@
         <label class="f">Desde<input type="time" name="start" value="${v('start')}"></label>
         <label class="f">Hasta<input type="time" name="end" value="${v('end')}"></label>
       </div>
-      <label class="switch"><span>Hora fija<small>Apagado = horquilla orientativa</small></span><input type="checkbox" name="fixed" ${it.fixed ? 'checked' : ''}></label>
       <div class="two">
-        <label class="f">Zona<input name="zone" value="${v('zone')}" placeholder="Triana…"></label>
-        <label class="f">Lugar en el mapa<input name="map" value="${v('map')}" placeholder="Nombre o dirección"></label>
+        <label class="f">Duración<select name="dur"><option value="">—</option>${DURS.map((d) => `<option value="${d}" ${d === it.dur ? 'selected' : ''}>${fmtDur(d)}</option>`).join('')}${it.dur && !DURS.includes(it.dur) ? `<option value="${it.dur}" selected>${fmtDur(it.dur)}</option>` : ''}</select></label>
+        <label class="f">Prioridad<select name="prio"><option value="">—</option>${Object.entries(PRIOS).map(([k, n]) => `<option value="${k}" ${k === it.prio ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
       </div>
+      <label class="switch"><span>Hora fija<small>Apagado = hora orientativa</small></span><input type="checkbox" name="fixed" ${it.fixed ? 'checked' : ''}></label>
+      <div class="two">
+        ${pick('zone', 'Zona', ZONES, it.zone)}
+        ${pick('move', 'Cómo se llega', MOVES, it.move)}
+      </div>
+      <div class="two">
+        ${pick('resv', 'Reserva', RESVS, it.resv)}
+        ${pick('food', 'Comida', FOODS, it.food)}
+      </div>
+      <label class="f">Lugar en el mapa<input name="map" value="${v('map')}" placeholder="Nombre o dirección para «Cómo llegar»"></label>
       <label class="f">Detalles del plan<textarea name="note" placeholder="Consejos, qué reservar…">${v('note')}</textarea></label>
       <label class="f">Nuestra nota<textarea name="my" placeholder="Qué tal fue, dónde comimos…">${esc(id ? state.notes[id] || '' : '')}</textarea></label>
       ${sheetButtons(id ? (it.custom ? 'Borrar' : 'Quitar') : '')}`, (f, btn) => {
-      if (btn === 'delete') {
-        if (it.custom) state.custom = state.custom.filter((c) => c.id !== id); else state.hidden[id] = true;
-        delete state.done[id];
-        toast(it.custom ? 'Borrado' : 'Quitado del plan (se puede recuperar abajo)');
-        return;
-      }
-      const data = { title: f.title.trim(), date: f.date, kind: f.kind, start: f.start, end: f.end, fixed: !!f.fixed, zone: f.zone.trim(), map: f.map.trim(), note: f.note.trim() };
+      if (btn === 'delete') { removeItem(id); return; }
+      const dur = +f.dur || (f.start && f.end && mins(f.end) > mins(f.start) ? mins(f.end) - mins(f.start) : 0);
+      const data = {
+        title: f.title.trim(), date: f.date, kind: f.kind, start: f.start, end: f.end, fixed: !!f.fixed, dur, prio: f.prio,
+        zone: picked(f, 'zone'), move: picked(f, 'move'), resv: picked(f, 'resv'), food: picked(f, 'food'), map: f.map.trim(), note: f.note.trim(),
+      };
       const key = id || 'c' + uid();
       if (!id) state.custom.push({ id: key, ...data });
       else if (it.custom) Object.assign(state.custom.find((x) => x.id === id) || {}, data);
@@ -840,13 +897,42 @@
     });
   }
 
+  function removeItem(id) {
+    const it = findItem(id);
+    if (!it) return;
+    if (it.custom) state.custom = state.custom.filter((c) => c.id !== id); else state.hidden[id] = true;
+    delete state.done[id];
+    toast(it.custom ? 'Borrado' : 'Quitado · se puede recuperar al final del día');
+  }
+
+  // Los desplegables del formulario se rellenan unos a otros.
+  $('#sheetBody').addEventListener('change', (e) => {
+    const t = e.target, el = (n) => e.currentTarget.elements[n];
+    const setPick = (name, value) => {
+      const sel = el(name), has = [...sel.options].some((o) => o.value === value);
+      sel.value = !value ? '' : has ? value : '__other';
+      el(name + '_other').value = has ? '' : value || '';
+      el(name + '_other').hidden = sel.value !== '__other';
+    };
+    const applyDur = () => { if (el('start') && el('start').value && el('dur').value) el('end').value = addMin(el('start').value, +el('dur').value); };
+    if (t.matches('select[data-other]')) { const o = el(t.name + '_other'); o.hidden = t.value !== '__other'; if (!o.hidden) o.focus(); }
+    if (t.name === 'catalog' && t.value !== '') {
+      const c = CATALOG[+t.value];
+      el('title').value = c.name; el('kind').value = c.kind; el('map').value = c.map || '';
+      el('dur').value = DURS.includes(c.dur) ? c.dur : '';
+      setPick('zone', c.zone); setPick('move', c.move || 'A pie'); setPick('food', c.food || '');
+      applyDur();
+    }
+    if (t.name === 'dur' || t.name === 'start') applyDur();
+  });
+
   function editDay() {
     const d = dayInfo(dayOf(selDay));
     openSheet(`
       <h3>${esc(d.name)}</h3>
       <label class="f">Título del día<input name="title" required value="${esc(d.title)}"></label>
       <label class="f">Resumen<textarea name="summary">${esc(d.summary)}</textarea></label>
-      ${sheetButtons()}`, (f) => { state.days[selDay] = { title: f.title.trim(), summary: f.summary.trim() }; });
+      ${sheetButtons()}`, (f) => { state.days[selDay] = { ...(state.days[selDay] || {}), title: f.title.trim(), summary: f.summary.trim() }; });
   }
 
   function editResv(id) {
@@ -983,7 +1069,24 @@
       case 'tix-forget':
         if (confirm('¿Olvidar la clave en este móvil? Los billetes siguen guardados, pero habrá que volver a escribirla para verlos.')) { tKey = null; lsSet(TKEY, null); tickets = []; tLoaded = false; render(); }
         break;
-      case 'toggle': if (open.has(id)) open.delete(id); else { open.add(id); justOpen = id; } render(); break;
+      case 'toggle':
+        if (editMode) { itemSheet(id); break; }
+        if (open.has(id)) open.delete(id); else { open.add(id); justOpen = id; }
+        render(); break;
+      case 'edit-mode': editMode = !editMode; render(); break;
+      case 'mv': {
+        const ids = itemsFor(dayOf(selDay)).map((x) => x.id), i = ids.indexOf(id), j = i + +el.dataset.dir;
+        if (i < 0 || j < 0 || j >= ids.length) break;
+        [ids[i], ids[j]] = [ids[j], ids[i]];
+        state.days[selDay] = { ...(state.days[selDay] || {}), order: ids.join(',') };
+        save(); render(); break;
+      }
+      case 'sort-time': { const d = { ...(state.days[selDay] || {}) }; delete d.order; state.days[selDay] = d; save(); render(); break; }
+      case 'rm': {
+        const it = findItem(id);
+        if (it && it.custom && !confirm(`¿Borrar «${it.title}»?`)) break;
+        removeItem(id); save(); render(); break;
+      }
       case 'done':
         if (state.done[id]) delete state.done[id];
         else {

@@ -374,3 +374,22 @@ label.f > * { text-transform: none; }
 .viewer img { flex: 1; min-height: 0; max-width: 100%; object-fit: contain; }
 .viewer .btn { flex: none; min-width: 140px; min-height: 46px; }
 .seg button { padding: 0 4px; white-space: nowrap; }
+
+/* Modo edición del día y formulario con desplegables */
+.edit-bar { display: flex; gap: 6px; padding: 0 12px 12px 16px; }
+.edit-bar button {
+  min-height: 36px; padding: 0 12px; border: 0; border-radius: 10px; font-size: 14px; font-weight: 600;
+  background: var(--fill); color: var(--tint);
+}
+.edit-bar button[data-act=mv] { width: 40px; padding: 0; font-size: 17px; }
+.edit-bar button:disabled { opacity: .3; }
+.edit-bar .del { color: var(--red); margin-left: auto; }
+.add-big {
+  width: 100%; min-height: 48px; border: 1.5px dashed color-mix(in srgb, var(--tint) 45%, transparent); border-radius: 14px;
+  background: none; color: var(--tint); font-weight: 600; font-size: 16px; margin-bottom: 4px;
+}
+.f select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%238e8e93' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center; background-size: 11px; padding-right: 30px; text-overflow: ellipsis;
+}
+.f input[hidden] { display: none; }
