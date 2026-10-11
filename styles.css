@@ -1,5 +1,6 @@
 /* Aspecto iOS: colores y tipografía del sistema, listas agrupadas, barras translúcidas. */
 :root {
+  color-scheme: light;
   --bg: #f2f2f7;
   --card: #fff;
   --ink: #000;
@@ -14,8 +15,24 @@
   --bar: rgba(249, 249, 249, .8);
   --tabs-h: 52px;
 }
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --bg: #000;
+  --card: #1c1c1e;
+  --ink: #fff;
+  --muted: rgba(235, 235, 245, .6);
+  --line: rgba(84, 84, 88, .6);
+  --fill: rgba(120, 120, 128, .24);
+  --tint: #0a84ff;
+  --ok: #30d158;
+  --warn: #ff9f0a;
+  --red: #ff453a;
+  --purple: #bf5af2;
+  --bar: rgba(22, 22, 24, .8);
+}
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root[data-theme=auto] {
+    color-scheme: dark;
     --bg: #000;
     --card: #1c1c1e;
     --ink: #fff;
@@ -249,3 +266,36 @@ label.f > * { text-transform: none; }
   .add-row { margin-left: 52px; }
   .top h1 { font-size: 30px; }
 }
+
+/* Horquillas, enlaces e interruptores */
+.item-time.flex .range { display: block; font-size: 14px; line-height: 1.25; color: var(--muted); }
+.item-time.flex small { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
+.link { border: 0; background: none; color: var(--tint); font-size: 15px; padding: 4px 0 4px 8px; flex: none; }
+.add-row .btn + .btn { margin-top: 0; }
+.switch {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: var(--card); border-radius: 12px; padding: 9px 14px; font-size: 17px;
+}
+.switch small { display: block; font-size: 13px; color: var(--muted); }
+.switch input {
+  -webkit-appearance: none; appearance: none; flex: none; margin: 0;
+  width: 51px; height: 31px; border-radius: 99px; background: var(--fill); position: relative; transition: background .2s;
+}
+.switch input::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%;
+  background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, .25); transition: transform .2s;
+}
+.switch input:checked { background: var(--ok); }
+.switch input:checked::after { transform: translateX(20px); }
+.sheet { overflow-y: auto; }
+
+/* Estado de sincronización y selector de tema */
+.status-wrap { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.status-wrap .status-pill { margin: 0; }
+.sync-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); }
+.sync-dot.wait { background: var(--warn); }
+.sync-dot.off { display: none; }
+.seg { display: flex; background: var(--fill); border-radius: 9px; padding: 2px; }
+.seg button { flex: 1; border: 0; background: none; min-height: 32px; border-radius: 7px; font-size: 14px; font-weight: 500; }
+.seg button.on { background: var(--card); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); font-weight: 600; }
+:root[data-theme=dark] .seg button.on { background: #636366; }

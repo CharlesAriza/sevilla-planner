@@ -6,8 +6,8 @@
 <title>Sevilla · 7–11 nov</title>
 <meta name="description" content="Itinerario y diario de nuestro viaje a Sevilla">
 <meta name="robots" content="noindex, nofollow">
-<meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" id="themeColor" content="#f2f2f7">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('sevilla-theme') || 'light'; } catch (e) { document.documentElement.dataset.theme = 'light'; }</script>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Sevilla">
@@ -24,7 +24,7 @@
       <p id="tripSub" class="top-sub"></p>
       <h1 id="tripTitle">Sevilla</h1>
     </div>
-    <div id="tripStatus" class="status-pill"></div>
+    <div class="status-wrap"><span id="syncDot" class="sync-dot off"></span><div id="tripStatus" class="status-pill"></div></div>
   </div>
 </header>
 
