@@ -1,7 +1,7 @@
 {
-  "name": "Sevilla · 7–11 nov 2026",
+  "name": "Sevilla",
   "short_name": "Sevilla",
-  "description": "Itinerario y diario de nuestro viaje a Sevilla",
+  "description": "Viaje privado",
   "lang": "es",
   "start_url": "./",
   "scope": "./",

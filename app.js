@@ -22,13 +22,11 @@
   // ---------- Sincronización entre móviles ----------
   // Usa una Firebase Realtime Database por REST: cada registro se envía por separado,
   // así dos personas pueden tocar cosas distintas a la vez sin pisarse.
-  const SYNC_KEY = 'sevilla-sync', SHADOW_KEY = 'sevilla-shadow', PHOTOQ_KEY = 'sevilla-fotos-pendientes';
+  const SHADOW_KEY = 'sevilla-shadow', SHADOW_ROOM = 'sevilla-shadow-sala', PHOTOQ_KEY = 'sevilla-fotos-pendientes';
   const MAPS = ['done', 'notes', 'edits', 'hidden', 'days', 'resv'];
   const LISTS = ['custom', 'bookings', 'journal', 'expenses'];
-  const storedSync = lsGet(SYNC_KEY);
-  let syncUrl = storedSync === 'off' ? '' : storedSync || SYNC_DEFAULT;
-  let shadow = {};   // último estado que sabemos que está en la nube
-  try { shadow = JSON.parse(lsGet(SHADOW_KEY) || '{}'); } catch (e) { /* vacío */ }
+  let syncUrl = '';   // la sala se calcula a partir de la clave al desbloquear
+  let shadow = {};   // último estado que sabemos que está en la nube (ya descifrado)
   let es = null, online = false, pushing = false, retryT, dirty = false;
   // Firmas de nuestros envíos recientes: su eco no debe tratarse como un cambio del otro móvil.
   const own = [];
@@ -74,7 +72,7 @@
   }
   const persist = () => {
     const ok = lsSet(KEY, JSON.stringify(state));
-    if (syncUrl) lsSet(SHADOW_KEY, JSON.stringify(shadow));
+    if (syncUrl) { lsSet(SHADOW_KEY, JSON.stringify(shadow)); lsSet(SHADOW_ROOM, syncUrl); }
     if (!ok) toast('No se pudo guardar en este móvil');
   };
   const save = () => { persist(); flush(); };
@@ -106,10 +104,13 @@
     const up = diff(toTree(state), shadow);
     if (!Object.keys(up).length) { flushPhotos(); return; }
     pushing = true;
-    const mine = sig(up);
-    own.push(mine);
+    let mine = null;
     try {
-      const r = await fetch(syncUrl + '.json', { method: 'PATCH', body: JSON.stringify(up) });
+      const enc = {};   // a la nube solo sale cada registro cifrado
+      for (const [k, v] of Object.entries(up)) enc[k] = v === null ? null : await seal(v);
+      mine = sig(enc);
+      own.push(mine);
+      const r = await fetch(syncUrl + '.json', { method: 'PATCH', body: JSON.stringify(enc) });
       if (!r.ok) throw new Error(r.status);
       for (const [p, v] of Object.entries(up)) setPath(shadow, p.split('/'), v);
       lsSet(SHADOW_KEY, JSON.stringify(shadow));
@@ -117,7 +118,7 @@
       flush();
     } catch (e) {
       pushing = false;
-      if (own.includes(mine)) own.splice(own.indexOf(mine), 1);
+      if (mine && own.includes(mine)) own.splice(own.indexOf(mine), 1);
       clearTimeout(retryT); retryT = setTimeout(flush, 5000);
       syncDot();
     }
@@ -129,16 +130,40 @@
     syncDot();
     if (!syncUrl) return;
     es = new EventSource(syncUrl + '.json');
-    es.addEventListener('put', (e) => { const d = JSON.parse(e.data); online = true; onRemote(d.path, d.data, false); });
+    const split = (path) => path.split('/').filter(Boolean);
+    es.addEventListener('put', (e) => {
+      const d = JSON.parse(e.data);
+      enqueue(async () => { const plain = await openAt(split(d.path), d.data); online = true; onRemote(d.path, plain, false); });
+    });
     es.addEventListener('patch', (e) => {
       const d = JSON.parse(e.data), i = d.path === '/' ? own.indexOf(sig(d.data)) : -1;
       if (i >= 0) { own.splice(i, 1); return; }
-      onRemote(d.path, d.data, true);
+      enqueue(async () => {
+        const plain = {};
+        for (const [k, v] of Object.entries(d.data || {})) plain[k] = await openAt([...split(d.path), ...split(k)], v);
+        onRemote(d.path, plain, true);
+      });
     });
     es.onerror = () => {
       online = false; syncDot();
       if (es && es.readyState === 2) { clearTimeout(retryT); retryT = setTimeout(connect, 15000); }
     };
+  }
+
+  // Los eventos se descifran en orden, uno detrás de otro.
+  let remoteQ = Promise.resolve();
+  const enqueue = (fn) => { remoteQ = remoteQ.then(fn).catch(() => {}); };
+  // Descifra un trozo del árbol remoto: los registros viven en <sección>/<id>.
+  async function openAt(segs, data) {
+    if (data === null || data === undefined) return null;
+    if (segs.length >= 2) {
+      if (typeof data !== 'object' || !data.ct) return null;
+      try { return await unseal(data); } catch (e) { return null; }   // lo que no se pueda abrir, se ignora
+    }
+    if (typeof data !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(data)) { const o = await openAt([...segs, k], v); if (o !== null) out[k] = o; }
+    return out;
   }
 
   const pendingCount = () => (syncUrl ? Object.keys(diff(toTree(state), shadow)).length : 0);
@@ -148,28 +173,6 @@
     el.className = 'sync-dot ' + (!syncUrl ? 'off' : online && !pendingCount() ? 'ok' : 'wait');
     el.title = !syncUrl ? '' : online ? 'Sincronizado' : 'Sin conexión';
   }
-
-  // Acepta la URL de la base de datos (crea una sala nueva) o el enlace compartido desde el otro móvil.
-  function parseSync(text) {
-    let t = String(text || '').trim();
-    const i = t.indexOf('#sync=');
-    if (i >= 0) t = decodeURIComponent(t.slice(i + 6));
-    let u;
-    try { u = new URL(t); } catch (e) { return null; }
-    const local = ['localhost', '127.0.0.1'].includes(u.hostname);
-    if (u.protocol !== 'https:' && !local) return null;
-    let path = u.pathname.replace(/\.json$/, '').replace(/\/+$/, '');
-    if (!path || (local && path === '/db')) path += '/sevilla-' + uid() + uid();
-    return u.origin + path;
-  }
-  function setSync(url) {
-    syncUrl = url || '';
-    lsSet(SYNC_KEY, syncUrl || 'off');
-    shadow = {};
-    lsSet(SHADOW_KEY, null);
-    connect();
-  }
-  const shareLink = () => `${location.origin}${location.pathname}#sync=${encodeURIComponent(syncUrl)}`;
 
   // Las fotos van aparte (son grandes): se suben una vez y el otro móvil las baja cuando las necesita.
   const photoRemote = (id) => `${syncUrl}-fotos/${id}.json`;
@@ -184,7 +187,7 @@
     try {
       const blob = await idb('readonly', (s) => s.get(q[0]));
       if (blob) {
-        const r = await fetch(photoRemote(q[0]), { method: 'PUT', body: JSON.stringify(await blobToData(blob)) });
+        const r = await fetch(photoRemote(q[0]), { method: 'PUT', body: JSON.stringify(await seal({ data: await blobToData(blob) })) });
         if (!r.ok) throw new Error(r.status);
       }
       lsSet(PHOTOQ_KEY, JSON.stringify(photoQueue().filter((x) => x !== q[0])));
@@ -203,17 +206,24 @@
   const euro = (n) => n.toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
   const dayOf = (date) => DAYS.find((d) => d.date === date);
   const dayInfo = (d) => ({ ...d, ...(state.days[d.date] || {}) });
-  // Hora fija = venía cerrada en el Excel (billete o entrada); el resto son horquillas orientativas.
-  const ALL = DAYS.flatMap((d) => d.items.map((it) => ({ ...it, date: d.date, fixed: !!it.start && !it.approx })));
+  // El plan base (días, reservas, horarios) no está en el código público: llega cifrado y se rellena al desbloquear.
+  let TRIP = {}, DAYS = [], BOOKINGS = [], PLACES = [], TIPS = [], ALL = [], PEOPLE = [];
+  function applyBase(b) {
+    TRIP = b.TRIP || {}; DAYS = b.DAYS || []; BOOKINGS = b.BOOKINGS || []; PLACES = b.PLACES || []; TIPS = b.TIPS || [];
+    // Hora fija = venía cerrada en el Excel (billete o entrada); el resto son horquillas orientativas.
+    ALL = DAYS.flatMap((d) => d.items.map((it) => ({ ...it, date: d.date, fixed: !!it.start && !it.approx })));
+    PEOPLE = TRIP.people || [];
+    me = PEOPLE.includes(lsGet('sevilla-me')) ? lsGet('sevilla-me') : '';
+    if (!dayOf(selDay)) selDay = dayOf(today) ? today : (DAYS[0] || {}).date;
+  }
   const KINDS = { visit: 'Visita', walk: 'Paseo', food: 'Comida', train: 'Transporte', show: 'Espectáculo', stay: 'Alojamiento / traslado', custom: 'Otro' };
 
   const today = ymd(now());
-  const PEOPLE = TRIP.people || [];
-  let me = PEOPLE.includes(lsGet('sevilla-me')) ? lsGet('sevilla-me') : '';
+  let me = '';
   const other = () => (me && PEOPLE.find((p) => p !== me)) || 'El otro móvil';
   let resvFilter = 'todo', flash = null, justOpen = null, editMode = false;
   let tab = 'plan';
-  let selDay = dayOf(today) ? today : DAYS[0].date;
+  let selDay = '';
   const open = new Set();
 
   // ---------- Fotos (IndexedDB) ----------
@@ -234,7 +244,8 @@
     if (!urls.has(id)) {
       let blob = await idb('readonly', (s) => s.get(id));
       if (!blob && syncUrl) {
-        const data = await fetch(photoRemote(id)).then((r) => r.json()).catch(() => null);
+        const rec = await fetch(photoRemote(id)).then((r) => r.json()).catch(() => null);
+        const data = rec && rec.ct ? await unseal(rec).then((o) => o.data, () => null) : null;
         if (typeof data === 'string' && data.startsWith('data:image/')) {
           blob = await (await fetch(data)).blob();
           await idb('readwrite', (s) => s.put(blob, id));
@@ -492,7 +503,7 @@
   async function deriveKey(pass) {
     const te = new TextEncoder();
     const base = await crypto.subtle.importKey('raw', te.encode(pass.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
-    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('sevilla-billetes:' + SYNC_DEFAULT), iterations: 600000 }, base, 256);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('sevilla-billetes:' + CONFIG.legacy), iterations: 600000 }, base, 256);
     return b64(bits);
   }
   const importKey = (raw) => crypto.subtle.importKey('raw', unb64(raw), 'AES-GCM', false, ['encrypt', 'decrypt']);
@@ -543,7 +554,7 @@
       return `<div class="panel" style="margin-top:14px">
         <h3>Billetes privados</h3>
         <p class="txt">Guardad aquí los PDF o fotos de billetes y entradas. Se cifran en el móvil con una clave que solo sabéis vosotros dos: sin ella nadie puede abrirlos.</p>
-        <div class="actions"><button class="btn primary" data-act="tix-key">Poner la clave</button></div>
+
       </div>`;
     }
     if (!tLoaded) return '<div class="empty">Cargando billetes…</div>';
@@ -564,35 +575,10 @@
     }).join('');
     return `${list || '<div class="empty">Aún no hay billetes. Pulsad + arriba para añadir el primero.</div>'}
       ${tLocked ? `<div class="empty">Hay ${tLocked} billete${tLocked > 1 ? 's' : ''} que no se puede${tLocked > 1 ? 'n' : ''} abrir con la clave de este móvil.</div>` : ''}
-      <div class="empty" style="padding-top:8px">Cifrados con vuestra clave · <button class="link" style="padding:0" data-act="tix-forget">olvidar clave en este móvil</button></div>`;
-  }
-
-  function ticketKeySheet() {
-    openSheet(`
-      <h3>Clave de los billetes</h3>
-      <p class="sheet-p">Elegid una entre los dos y escribidla igual en cada móvil, una sola vez. Mejor una frase que un PIN: si se olvida, los billetes guardados no se pueden recuperar.</p>
-      <label class="f">Clave<input name="pass" required minlength="8" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Mínimo 8 caracteres"></label>
-      ${sheetButtons()}`, async (f) => {
-      try {
-        const raw = await deriveKey(f.pass);
-        const key = await importKey(raw);
-        if (syncUrl && navigator.onLine !== false) {
-          const check = await fetch(`${tBase()}/_check.json`).then((r) => r.json()).catch(() => null);
-          if (check && check.ct) {
-            try { await unseal(check, key); } catch (e) { toast('Esa clave no coincide con la del otro móvil'); return; }
-          } else {
-            await fetch(`${tBase()}/_check.json`, { method: 'PUT', body: JSON.stringify(await seal({ ok: 1 }, key)) }).catch(() => {});
-          }
-        }
-        tKey = key; lsSet(TKEY, raw); tLoaded = false;
-        await loadTickets();
-        toast('Clave guardada en este móvil');
-      } catch (e) { toast('No se pudo guardar la clave'); }
-    });
+      <div class="empty" style="padding-top:8px">Cifrados con la clave del viaje.</div>`;
   }
 
   function ticketSheet() {
-    if (!tKey) return ticketKeySheet();
     openSheet(`
       <h3>Nuevo billete</h3>
       <label class="f">Qué es<input name="title" required placeholder="AVE ida, entrada Alcázar…"></label>
@@ -722,27 +708,23 @@
       <div class="section-title">Consejos</div>
       <div class="panel"><ul class="tips">${TIPS.map((t) => `<li>${esc(t)}</li>`).join('')}</ul></div>
       <div class="section-title">Sincronización entre los dos móviles</div>
-      <div class="panel">${syncUrl ? `
+      <div class="panel">
         <h3>${online ? (pendingCount() ? 'Enviando cambios…' : 'Sincronizado') : 'Sin conexión'}</h3>
-        <p class="txt">Lo que marca o apunta uno le aparece al otro al momento, sin hacer nada. Sin cobertura se guarda en el móvil y se envía al recuperarla.</p>
-        <div class="actions">
-          <button class="btn danger" data-act="sync-off">Desactivar aquí</button>
-        </div>` : `
-        <h3>Desactivada</h3>
-        <p class="txt">Este móvil no está compartiendo los cambios. Pulsad «Activar» para volver a la sala del viaje (o pegad antes otro enlace).</p>
-        <label class="f" style="margin-top:10px"><input id="syncInput" placeholder="https://…" autocapitalize="off" autocorrect="off" spellcheck="false" style="background:var(--fill)"></label>
-        <div class="actions"><button class="btn primary" data-act="sync-on">Activar</button></div>`}
+        <p class="txt">Lo que marca o apunta uno le aparece al otro al momento. Todo viaja y se guarda cifrado con la clave del viaje: sin ella nadie puede leerlo.</p>
+        <div class="actions"><button class="btn danger" data-act="lock">Bloquear este móvil</button></div>
       </div>
       <div class="section-title">Vuestros datos</div>
       <div class="panel">
-        <p class="txt" style="margin-top:0">Todo lo que apuntáis se guarda en el móvil${syncUrl ? ' y se comparte con el otro' : ''}. Con «Exportar copia» os lleváis un archivo con todo, fotos incluidas.</p>
+        <p class="txt" style="margin-top:0">Con «Exportar copia» os lleváis un archivo con todo lo apuntado, fotos incluidas (el archivo no va cifrado: guardadlo en un sitio seguro). «Actualizar plan» carga un plan nuevo para los dos.</p>
         <div class="actions">
           <button class="btn" data-act="export">Exportar copia</button>
           <button class="btn" data-act="import">Importar copia</button>
+          <button class="btn" data-act="plan-file">Actualizar plan</button>
           <button class="btn" data-act="reset-plan">Restaurar plan original</button>
           <button class="btn danger" data-act="wipe">Borrar todo</button>
         </div>
         <input type="file" id="importFile" accept="application/json,.json" hidden>
+        <input type="file" id="planFile" accept="application/json,.json" hidden>
       </div>
       <div class="panel">
         <h3>Tenerla como app</h3>
@@ -1062,13 +1044,9 @@
       case 'plus': ({ plan: itemSheet, resv: () => (resvFilter === 'tix' ? ticketSheet() : editResv()), diary: editJournal, money: addExpense }[tab] || (() => {}))(); break;
       case 'me': me = id; lsSet('sevilla-me', me); render(); break;
       case 'resv-filter': resvFilter = id; render(); if (id === 'tix') refreshTickets(); break;
-      case 'tix-key': ticketKeySheet(); break;
       case 'tix-open': openTicket(id); break;
       case 'tix-del': deleteTicket(id); break;
       case 'tix-close': $('#viewer').close(); break;
-      case 'tix-forget':
-        if (confirm('¿Olvidar la clave en este móvil? Los billetes siguen guardados, pero habrá que volver a escribirla para verlos.')) { tKey = null; lsSet(TKEY, null); tickets = []; tLoaded = false; render(); }
-        break;
       case 'toggle':
         if (editMode) { itemSheet(id); break; }
         if (open.has(id)) open.delete(id); else { open.add(id); justOpen = id; }
@@ -1121,17 +1099,10 @@
       case 'e-add': addExpense(); break;
       case 'e-del': state.expenses = state.expenses.filter((x) => x.id !== id); save(); render(); break;
       case 'theme': theme = applyTheme(id); render(); break;
-      case 'sync-on': {
-        const url = $('#syncInput').value.trim() ? parseSync($('#syncInput').value) : SYNC_DEFAULT;
-        if (!url) { toast('Ese enlace no es válido'); break; }
-        setSync(url); render(); toast('Sincronización activada');
+      case 'lock':
+        if (confirm('¿Bloquear este móvil? Habrá que volver a escribir la clave del viaje para entrar.')) lock();
         break;
-      }
-      case 'sync-off': if (confirm('¿Dejar de sincronizar en este móvil? Los datos se quedan guardados aquí.')) { setSync(''); render(); } break;
-      case 'sync-share':
-        if (navigator.share) navigator.share({ title: 'Sevilla', text: 'Abre este enlace para compartir el plan del viaje', url: shareLink() }).catch(() => {});
-        else navigator.clipboard.writeText(shareLink()).then(() => toast('Enlace copiado'), () => prompt('Copiad este enlace:', shareLink()));
-        break;
+      case 'plan-file': $('#planFile').click(); break;
       case 'export': exportAll(); break;
       case 'import': $('#importFile').click(); break;
       case 'wipe':
@@ -1164,30 +1135,180 @@
 
   document.addEventListener('change', (e) => {
     if (e.target.id === 'importFile' && e.target.files[0]) importAll(e.target.files[0]);
+    if (e.target.id === 'planFile' && e.target.files[0]) importPlan(e.target.files[0]);
+    if (e.target.id === 'setupFile' && e.target.files[0]) setupPlan(e.target.files[0]);
   });
 
-  header();
+  // ---------- Privacidad: todo cifrado con la clave del viaje ----------
+  // La sala de cada viaje se deriva de la clave, así que sin ella ni siquiera se sabe dónde buscar.
+  const BASE_KEY = 'sevilla-plan';
+  const validPlan = (b) => !!(b && b.TRIP && Array.isArray(b.DAYS) && b.DAYS.every((d) => d.date && Array.isArray(d.items)));
+  const getJSON = async (url) => { const r = await fetch(url); if (!r.ok) throw new Error(r.status); return r.json(); };
+  const putJSON = (url, body) => fetch(url, { method: 'PUT', body: JSON.stringify(body) }).then((r) => { if (!r.ok) throw new Error(r.status); });
+  async function roomFor(raw) {
+    const h = new Uint8Array(await crypto.subtle.digest('SHA-256', unb64(raw)));
+    return `${CONFIG.db}/v-${[...h].map((x) => x.toString(16).padStart(2, '0')).join('').slice(0, 40)}`;
+  }
+  const cachedBase = () => { try { return JSON.parse(lsGet(BASE_KEY) || 'null'); } catch (e) { return null; } };
+
+  function lock() {
+    lsSet(TKEY, null); lsSet(BASE_KEY, null); lsSet(SHADOW_KEY, null); lsSet(SHADOW_ROOM, null);
+    location.reload();
+  }
+
+  function showLock(msg) {
+    document.body.classList.add('locked');
+    $('#view').innerHTML = `<div class="lock">
+      <div class="lock-icon"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+      <h2>Viaje privado</h2>
+      <p>Escribid la clave del viaje. Solo hace falta una vez en cada móvil.</p>
+      <form id="lockForm">
+        <input name="pass" type="password" required minlength="8" autocomplete="current-password" placeholder="Clave del viaje" aria-label="Clave del viaje">
+        <button class="btn primary block">Entrar</button>
+      </form>
+      <p class="lock-msg">${esc(msg || '')}</p>
+    </div>`;
+  }
+  document.addEventListener('submit', async (e) => {
+    if (e.target.id !== 'lockForm') return;
+    e.preventDefault();
+    const btn = e.target.querySelector('button'), pass = e.target.elements.pass.value;
+    btn.disabled = true; btn.textContent = 'Comprobando…';
+    const fail = (m) => { showLock(m); };
+    try {
+      const raw = await deriveKey(pass);
+      const key = await importKey(raw);
+      const room = await roomFor(raw);
+      let base = await getJSON(`${room}-base.json`);
+      if (base && base.ct) base = await unseal(base, key).catch(() => null);
+      else {
+        base = null;
+        // Aún no hay plan en la sala: comprobamos la clave con la marca de la sala antigua.
+        const chk = (await getJSON(`${CONFIG.legacy}/check.json`).catch(() => null)) || (await getJSON(`${CONFIG.legacy}-billetes/_check.json`).catch(() => null));
+        if (!chk || !chk.ct) return fail('No hay ningún viaje con esa clave.');
+        try { await unseal(chk, key); } catch (err) { return fail('Clave incorrecta.'); }
+      }
+      lsSet(TKEY, raw);
+      start(key, room, base);
+    } catch (err) { fail('No se pudo comprobar la clave. ¿Hay conexión?'); }
+  });
+
+  // Primera vez en este viaje: el plan no está en la web (es privado) y hay que cargarlo una vez desde un archivo.
+  function showSetup(room) {
+    document.body.classList.add('locked');
+    $('#view').innerHTML = `<div class="lock">
+      <div class="lock-icon"><svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg></div>
+      <h2>Cargar el plan</h2>
+      <p>Clave correcta. Es la primera vez en este viaje: elegid el archivo del plan (<b>plan-sevilla.json</b>). Se cifra y se guarda; los demás móviles solo necesitan la clave.</p>
+      <label class="btn primary block" style="cursor:pointer">Elegir archivo<input id="setupFile" type="file" accept="application/json,.json" hidden></label>
+      <p class="lock-msg" id="setupMsg"></p>
+    </div>`;
+    setupRoom = room;
+  }
+  let setupRoom = '';
+  async function setupPlan(file) {
+    try {
+      const b = JSON.parse(await file.text());
+      if (!validPlan(b)) throw new Error('formato');
+      await putJSON(`${setupRoom}-base.json`, await seal(b));
+      start(tKey, setupRoom, b);
+    } catch (e) { $('#setupMsg').textContent = 'Ese archivo no es un plan válido.'; }
+  }
+
+  function start(key, room, base) {
+    tKey = key; syncUrl = room;
+    shadow = {};
+    if (lsGet(SHADOW_ROOM) === room) { try { shadow = JSON.parse(lsGet(SHADOW_KEY) || '{}'); } catch (e) { shadow = {}; } }
+    const b = base || cachedBase();
+    if (!b) { showSetup(room); return; }
+    if (base) lsSet(BASE_KEY, JSON.stringify(base));
+    applyBase(b);
+    document.body.classList.remove('locked');
+    header();
+    render();
+    askWho();
+    connect();
+    refreshTickets();
+    syncBase(!base).then(migrate);
+  }
+
+  // Trae el plan cifrado de la nube (o lo sube si aún no está, la primera vez).
+  async function syncBase(fetchIt) {
+    try {
+      let remote = fetchIt ? await getJSON(`${syncUrl}-base.json`) : true;
+      if (remote && remote.ct) {
+        const b = await unseal(remote);
+        if (JSON.stringify(b) !== lsGet(BASE_KEY)) { lsSet(BASE_KEY, JSON.stringify(b)); applyBase(b); header(); if (!sheet.open) render(); }
+      } else if (!remote) {
+        const b = cachedBase();
+        if (b) { await putJSON(`${syncUrl}-base.json`, await seal(b)); lsSet(BASE_KEY, JSON.stringify(b)); }
+      }
+    } catch (e) { /* sin conexión: seguimos con la copia del móvil */ }
+  }
+
+  // Paso único desde la sala antigua (sin cifrar): se copia todo cifrado y se deja solo una marca.
+  async function migrate() {
+    try {
+      const L = CONFIG.legacy;
+      const old = await getJSON(`${L}.json`);
+      const oldT = await getJSON(`${L}-billetes.json`);
+      const oldF = await getJSON(`${L}-fotos.json?shallow=true`);
+      const data = old && Object.keys(old).some((k) => MAPS.includes(k) || LISTS.includes(k)) ? old : null;
+      if (!data && !oldT && !oldF) return;
+      if (data) {   // juntamos lo de la nube antigua con lo del móvil; gana lo del móvil
+        const merged = JSON.parse(JSON.stringify(data)), loc = toTree(state);
+        for (const sec of [...MAPS, ...LISTS]) for (const [id, v] of Object.entries(loc[sec] || {})) setPath(merged, [sec, id], v);
+        state = fromTree(merged); save(); if (!sheet.open) render();
+      }
+      if (oldT) for (const [id, rec] of Object.entries(oldT)) if (rec && rec.ct) await putJSON(`${tBase()}/${id}.json`, rec);
+      if (oldF) {
+        for (const id of Object.keys(oldF)) {
+          const d = await getJSON(`${L}-fotos/${id}.json`);
+          if (typeof d === 'string') await putJSON(photoRemote(id), await seal({ data: d }));
+        }
+      }
+      await putJSON(`${L}.json`, { migrado: true, check: await seal({ ok: 1 }) });
+      await fetch(`${L}-billetes.json`, { method: 'DELETE' });
+      await fetch(`${L}-fotos.json`, { method: 'DELETE' });
+      refreshTickets();
+    } catch (e) { /* se reintenta la próxima vez */ }
+  }
+
+  async function importPlan(file) {
+    try {
+      const b = JSON.parse(await file.text());
+      if (!validPlan(b)) throw new Error('formato');
+      if (!confirm('¿Cargar este plan para los dos? Vuestros cambios, el diario y los gastos se conservan.')) return;
+      await putJSON(`${syncUrl}-base.json`, await seal(b));
+      lsSet(BASE_KEY, JSON.stringify(b));
+      applyBase(b); header(); render(); toast('Plan actualizado');
+    } catch (e) { toast('No se pudo cargar ese plan'); }
+  }
+
   // La primera vez preguntamos de quién es el móvil (para «quién pagó» y firmar el diario).
-  if (!me && PEOPLE.length && !lsGet('sevilla-me')) {
+  function askWho() {
+    if (me || !PEOPLE.length || lsGet('sevilla-me')) return;
     lsSet('sevilla-me', '-');
     openSheet(`<h3>¿De quién es este móvil?</h3>
       <p class="sheet-p">Así sabemos quién paga cada gasto y quién apunta cada momento.</p>
       <div class="sheet-actions">${PEOPLE.map((p) => `<button class="btn primary" value="${esc(p)}">${esc(p)}</button>`).join('')}</div>
       <button class="btn ghost" value="cancel" formnovalidate>Ahora no</button>`, (f, v) => { me = v; lsSet('sevilla-me', me); });
   }
-  // Enlace compartido desde el otro móvil: .../#sync=<url>
-  if (location.hash.startsWith('#sync=')) {
-    const url = parseSync(location.hash);
-    history.replaceState(null, '', location.pathname + location.search);
-    if (url && url !== syncUrl) { setSync(url); setTimeout(() => toast('Sincronización activada'), 300); }
-  }
-  if (syncUrl && !es) connect();
-  if (canCrypt && lsGet(TKEY)) importKey(lsGet(TKEY)).then((k) => { tKey = k; return refreshTickets(); }).catch(() => {});
+
   window.addEventListener('online', () => { if (syncUrl && (!es || es.readyState === 2)) connect(); else flush(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && syncUrl && (!es || es.readyState === 2)) connect(); });
-  render();
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !syncUrl) return;
+    if (!es || es.readyState === 2) connect();
+    syncBase(true);
+  });
+
+  if (!canCrypt) showLock('Este navegador no permite cifrar. Abrid la web en Safari o Chrome.');
+  else if (lsGet(TKEY)) {
+    const raw = lsGet(TKEY);
+    Promise.all([importKey(raw), roomFor(raw)]).then(([k, room]) => start(k, room, null)).catch(() => showLock());
+  } else showLock();
   // Refresca "Ahora / Siguiente" mientras la app está abierta.
-  setInterval(() => { if (tab === 'plan' && !sheet.open && selDay === today) render(); }, 60000);
+  setInterval(() => { if (syncUrl && tab === 'plan' && !sheet.open && selDay === today) render(); }, 60000);
 
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});

@@ -1,6 +1,6 @@
 // Red primero, caché como respaldo: siempre la última versión con cobertura, y funciona sin ella.
-const CACHE = 'sevilla-v8';
-const FILES = ['./', 'index.html', 'styles.css', 'data.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png'];
+const CACHE = 'sevilla-v9';
+const FILES = ['./', 'index.html', 'styles.css', 'config.js', 'catalog.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
