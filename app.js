@@ -713,6 +713,11 @@
         <p class="txt">Lo que marca o apunta uno le aparece al otro al momento. Todo viaja y se guarda cifrado con la clave del viaje: sin ella nadie puede leerlo.</p>
         <div class="actions"><button class="btn danger" data-act="lock">Bloquear este móvil</button></div>
       </div>
+      <div class="panel">
+        <h3>Código de acceso</h3>
+        <p class="txt">Vale como clave en otro móvil u ordenador, sin saber la frase. Guardadlo en un gestor de contraseñas y no lo compartáis con nadie más: da acceso a todo.</p>
+        <div class="actions"><button class="btn" data-act="copy-code">Copiar código</button></div>
+      </div>
       <div class="section-title">Vuestros datos</div>
       <div class="panel">
         <p class="txt" style="margin-top:0">Con «Exportar copia» os lleváis un archivo con todo lo apuntado, fotos incluidas (el archivo no va cifrado: guardadlo en un sitio seguro). «Actualizar plan» carga un plan nuevo para los dos.</p>
@@ -1099,6 +1104,14 @@
       case 'e-add': addExpense(); break;
       case 'e-del': state.expenses = state.expenses.filter((x) => x.id !== id); save(); render(); break;
       case 'theme': theme = applyTheme(id); render(); break;
+      case 'lost': showLost(); break;
+      case 'lock-back': showLock(); break;
+      case 'copy-code': {
+        const code = lsGet(TKEY) || '';
+        if (navigator.clipboard) navigator.clipboard.writeText(code).then(() => toast('Código copiado'), () => prompt('Copiad este código:', code));
+        else prompt('Copiad este código:', code);
+        break;
+      }
       case 'lock':
         if (confirm('¿Bloquear este móvil? Habrá que volver a escribir la clave del viaje para entrar.')) lock();
         break;
@@ -1167,16 +1180,47 @@
         <button class="btn primary block">Entrar</button>
       </form>
       <p class="lock-msg">${esc(msg || '')}</p>
+      <button class="link" data-act="lost">No recuerdo la clave</button>
     </div>`;
   }
+
+  function showLost() {
+    $('#view').innerHTML = `<div class="lock">
+      <h2>Sin clave</h2>
+      <p style="text-align:left"><b>1. Probad primero en un dispositivo donde ya entrasteis.</b> Si no cerrasteis sesión, entra solo. Allí, en Info → «Código de acceso», copiad el código: vale como clave en los demás.</p>
+      <p style="text-align:left"><b>2. Si no queda ninguno</b>, cread una clave nueva. Se conservan el plan, notas, diario, gastos y fotos; los billetes ya subidos no se pueden abrir y habrá que volver a subirlos.</p>
+      <form id="newKeyForm">
+        <input name="pass" type="password" required minlength="8" autocomplete="new-password" placeholder="Clave nueva (mínimo 8 caracteres)" aria-label="Clave nueva">
+        <input name="pass2" type="password" required minlength="8" autocomplete="new-password" placeholder="Repetid la clave" aria-label="Repetir la clave">
+        <button class="btn primary block">Crear clave nueva</button>
+      </form>
+      <p class="lock-msg"></p>
+      <button class="link" data-act="lock-back">Volver</button>
+    </div>`;
+  }
+  const isCode = (t) => /^[A-Za-z0-9+/]{43}=$/.test(t.trim());   // el código de acceso es la clave ya derivada
   document.addEventListener('submit', async (e) => {
+    if (e.target.id === 'newKeyForm') {
+      e.preventDefault();
+      const f = e.target.elements, msg = e.target.parentElement.querySelector('.lock-msg');
+      if (f.pass.value !== f.pass2.value) { msg.textContent = 'Las dos claves no coinciden.'; return; }
+      const btn = e.target.querySelector('button'); btn.disabled = true; btn.textContent = 'Creando…';
+      try {
+        const raw = await deriveKey(f.pass.value), key = await importKey(raw), room = await roomFor(raw);
+        let base = await getJSON(`${room}-base.json`);   // si ya existe un viaje con esa clave, entramos en él
+        if (base && base.ct) base = await unseal(base, key).catch(() => null); else base = null;
+        lsSet(TKEY, raw);
+        start(key, room, base);
+      } catch (err) { btn.disabled = false; btn.textContent = 'Crear clave nueva'; msg.textContent = 'No se pudo crear. ¿Hay conexión?'; }
+      return;
+    }
     if (e.target.id !== 'lockForm') return;
     e.preventDefault();
     const btn = e.target.querySelector('button'), pass = e.target.elements.pass.value;
     btn.disabled = true; btn.textContent = 'Comprobando…';
     const fail = (m) => { showLock(m); };
     try {
-      const raw = await deriveKey(pass);
+      const raw = isCode(pass) ? pass.trim() : await deriveKey(pass);
       const key = await importKey(raw);
       const room = await roomFor(raw);
       let base = await getJSON(`${room}-base.json`);
@@ -1202,6 +1246,8 @@
       <p>Clave correcta. Es la primera vez en este viaje: elegid el archivo del plan (<b>plan-sevilla.json</b>). Se cifra y se guarda; los demás móviles solo necesitan la clave.</p>
       <label class="btn primary block" style="cursor:pointer">Elegir archivo<input id="setupFile" type="file" accept="application/json,.json" hidden></label>
       <p class="lock-msg" id="setupMsg"></p>
+      <button class="link" data-act="copy-code">Copiar código de acceso</button>
+      <p style="font-size:13px">Si el archivo del plan está en otro dispositivo, copiad el código y pegadlo allí como clave.</p>
     </div>`;
     setupRoom = room;
   }
@@ -1254,13 +1300,15 @@
       const oldT = await getJSON(`${L}-billetes.json`);
       const oldF = await getJSON(`${L}-fotos.json?shallow=true`);
       const data = old && Object.keys(old).some((k) => MAPS.includes(k) || LISTS.includes(k)) ? old : null;
-      if (!data && !oldT && !oldF) return;
+      let ticketsOk = false;
+      if (oldT && oldT._check && oldT._check.ct) { try { await unseal(oldT._check); ticketsOk = true; } catch (e) { /* otra clave */ } }
+      if (!data && !ticketsOk && !oldF) return;
       if (data) {   // juntamos lo de la nube antigua con lo del móvil; gana lo del móvil
         const merged = JSON.parse(JSON.stringify(data)), loc = toTree(state);
         for (const sec of [...MAPS, ...LISTS]) for (const [id, v] of Object.entries(loc[sec] || {})) setPath(merged, [sec, id], v);
         state = fromTree(merged); save(); if (!sheet.open) render();
       }
-      if (oldT) for (const [id, rec] of Object.entries(oldT)) if (rec && rec.ct) await putJSON(`${tBase()}/${id}.json`, rec);
+      if (ticketsOk) for (const [id, rec] of Object.entries(oldT)) if (rec && rec.ct) await putJSON(`${tBase()}/${id}.json`, rec);
       if (oldF) {
         for (const id of Object.keys(oldF)) {
           const d = await getJSON(`${L}-fotos/${id}.json`);
@@ -1268,7 +1316,7 @@
         }
       }
       await putJSON(`${L}.json`, { migrado: true, check: await seal({ ok: 1 }) });
-      await fetch(`${L}-billetes.json`, { method: 'DELETE' });
+      if (ticketsOk) await fetch(`${L}-billetes.json`, { method: 'DELETE' });
       await fetch(`${L}-fotos.json`, { method: 'DELETE' });
       refreshTickets();
     } catch (e) { /* se reintenta la próxima vez */ }
